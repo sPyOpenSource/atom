@@ -1,0 +1,6 @@
+{
+  "name": "Atom IDE",
+  "description": "A high-fidelity clone of the classic Atom IDE featuring a fully interactive file system, multi-tab layout, command palette, modular package settings, and an AI Coding Copilot powered by Gemini.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
