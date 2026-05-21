@@ -1,7 +1,9 @@
 import express from "express";
+import http from "http";
 import path from "path";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
+import { WebSocketServer, WebSocket } from "ws";
 import dotenv from "dotenv";
 
 dotenv.config();
@@ -124,6 +126,140 @@ app.post("/api/copilot/autofix", async (req, res) => {
   }
 });
 
+const server = http.createServer(app);
+
+// WebSocket real-time presence, state synchronization & chats
+interface ClientState {
+  id: string;
+  name: string;
+  color: string;
+  filePath: string | null;
+  cursor: { line: number; col: number } | null;
+}
+
+const clientConnections = new Map<WebSocket, ClientState>();
+
+const wss = new WebSocketServer({ noServer: true });
+
+// Setup manual HTTP server upgrade to route WebSocket handshake cleanly through standard port 3000
+server.on("upgrade", (request, socket, head) => {
+  const pathname = new URL(request.url || "", `http://${request.headers.host}`).pathname;
+  if (pathname === "/ws") {
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      wss.emit("connection", ws, request);
+    });
+  } else {
+    socket.destroy();
+  }
+});
+
+// Broadcast changes
+function broadcast(msg: any, excludeWs?: WebSocket) {
+  const json = JSON.stringify(msg);
+  for (const client of clientConnections.keys()) {
+    if (client !== excludeWs && client.readyState === WebSocket.OPEN) {
+      client.send(json);
+    }
+  }
+}
+
+// Connection workflow
+wss.on("connection", (ws: WebSocket) => {
+  const clientId = Math.random().toString(36).substring(2, 9);
+  
+  // Standard list of fun programmer pseudonyms to assign connecting clients
+  const pseudonyms = [
+    "AdaLovelace", "GraceHopper", "LinusTorvalds", "TimBernersLee",
+    "AlanTuring", "MargaretHamilton", "GuidoVanRossum", "SatoshiNakamoto",
+    "DennisRitchie", "BjarneStroustrup", "KatherineJohnson", "JohnVonNeumann"
+  ];
+  const chosenName = pseudonyms[Math.floor(Math.random() * pseudonyms.length)] + `_${clientId}`;
+  
+  const niceColors = [
+    "#ff5f56", "#ffbd2e", "#27c93f", "#61afef", "#c678dd", 
+    "#e5c07b", "#e06c75", "#56b6c2", "#98c379", "#f9826c"
+  ];
+  const chosenColor = niceColors[Math.floor(Math.random() * niceColors.length)];
+
+  const clientState: ClientState = {
+    id: clientId,
+    name: chosenName,
+    color: chosenColor,
+    filePath: null,
+    cursor: null
+  };
+
+  clientConnections.set(ws, clientState);
+
+  // Send init payload for state reconciliation
+  ws.send(JSON.stringify({
+    type: "init",
+    payload: {
+      userId: clientId,
+      users: Array.from(clientConnections.values())
+    }
+  }));
+
+  // Broadcast presence join trigger
+  broadcast({
+    type: "user:join",
+    payload: clientState
+  }, ws);
+
+  ws.on("message", (message) => {
+    try {
+      const data = JSON.parse(message.toString());
+      
+      switch (data.type) {
+        case "user:update": {
+          const state = clientConnections.get(ws);
+          if (state) {
+            Object.assign(state, data.payload);
+            broadcast({
+              type: "user:update",
+              payload: state
+            });
+          }
+          break;
+        }
+        case "file:change": {
+          broadcast({
+            type: "file:change",
+            payload: {
+              filePath: data.payload.filePath,
+              content: data.payload.content,
+              senderId: clientId
+            }
+          }, ws);
+          break;
+        }
+        case "chat:message": {
+          broadcast({
+            type: "chat:message",
+            payload: {
+              sender: clientState.name,
+              color: clientState.color,
+              text: data.payload.text,
+              timestamp: new Date().toISOString()
+            }
+          });
+          break;
+        }
+      }
+    } catch (err) {
+      console.error("Failed to parse incoming websocket action:", err);
+    }
+  });
+
+  ws.on("close", () => {
+    clientConnections.delete(ws);
+    broadcast({
+      type: "user:leave",
+      payload: { id: clientId }
+    });
+  });
+});
+
 // Setup Vite Dev Server / Static Ingress
 async function start() {
   if (process.env.NODE_ENV !== "production") {
@@ -142,7 +278,7 @@ async function start() {
     console.log("Serving production build from dist.");
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
+  server.listen(PORT, "0.0.0.0", () => {
     console.log(`Atom Server listening at http://0.0.0.0:${PORT}`);
   });
 }

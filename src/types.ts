@@ -41,3 +41,18 @@ export interface LinterMessage {
   message: string;
   source: string;
 }
+
+export interface CollaborativeUser {
+  id: string;
+  name: string;
+  color: string;
+  filePath: string | null;
+  cursor: { line: number; col: number } | null;
+}
+
+export interface ChatMessage {
+  sender: string;
+  color: string;
+  text: string;
+  timestamp: string;
+}

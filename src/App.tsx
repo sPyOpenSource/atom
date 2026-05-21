@@ -32,7 +32,9 @@ import {
   AtomPackage, 
   CommandPaletteAction, 
   SearchOptions, 
-  LinterMessage 
+  LinterMessage,
+  CollaborativeUser,
+  ChatMessage
 } from "./types";
 
 // Initial virtual project database
@@ -161,13 +163,134 @@ export default function App() {
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
+  // WebSocket / Collaboration state
+  const [wsStatus, setWsStatus] = useState<"connected" | "disconnected" | "connecting">("disconnected");
+  const [myUserId, setMyUserId] = useState<string>("");
+  const [myUsername, setMyUsername] = useState<string>("GuestCoder");
+  const [isEditingUsername, setIsEditingUsername] = useState<boolean>(false);
+  const [collaborativeUsers, setCollaborativeUsers] = useState<CollaborativeUser[]>([]);
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [chatInput, setChatInput] = useState("");
+  const [activeCopilotTab, setActiveCopilotTab] = useState<"ai" | "peers">("ai");
+
+  const wsRef = useRef<WebSocket | null>(null);
+
+  // WebSocket integration on mount
+  useEffect(() => {
+    let socket: WebSocket | null = null;
+    let reconnectTimeout: any;
+
+    const establishConnection = () => {
+      setWsStatus("connecting");
+      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+      const url = `${protocol}//${window.location.host}/ws`;
+
+      try {
+        socket = new WebSocket(url);
+        wsRef.current = socket;
+
+        socket.onopen = () => {
+          setWsStatus("connected");
+        };
+
+        socket.onmessage = (event) => {
+          try {
+            const data = JSON.parse(event.data);
+            switch (data.type) {
+              case "init": {
+                setMyUserId(data.payload.userId);
+                setCollaborativeUsers(data.payload.users);
+                // Find and save assigned name
+                const self = data.payload.users.find((u: any) => u.id === data.payload.userId);
+                if (self) {
+                  setMyUsername(self.name);
+                }
+                break;
+              }
+              case "user:join": {
+                const newcomer = data.payload;
+                setCollaborativeUsers(prev => {
+                  if (prev.some(u => u.id === newcomer.id)) return prev;
+                  return [...prev, newcomer];
+                });
+                break;
+              }
+              case "user:update": {
+                const alteredPeer = data.payload;
+                setCollaborativeUsers(prev => prev.map(u => u.id === alteredPeer.id ? alteredPeer : u));
+                break;
+              }
+              case "user:leave": {
+                const departedId = data.payload.id;
+                setCollaborativeUsers(prev => prev.filter(u => u.id !== departedId));
+                break;
+              }
+              case "file:change": {
+                const { filePath, content } = data.payload;
+                setFiles(prev => prev.map(f => {
+                  if (f.path === filePath && f.content !== content) {
+                    return { ...f, content };
+                  }
+                  return f;
+                }));
+                break;
+              }
+              case "chat:message": {
+                setChatMessages(prev => [...prev, data.payload]);
+                break;
+              }
+            }
+          } catch (err) {
+            console.error("Failed to parse websocket package event:", err);
+          }
+        };
+
+        socket.onerror = () => {
+          setWsStatus("disconnected");
+        };
+
+        socket.onclose = () => {
+          setWsStatus("disconnected");
+          reconnectTimeout = setTimeout(establishConnection, 4000);
+        };
+      } catch (e) {
+        console.error("WS error:", e);
+        reconnectTimeout = setTimeout(establishConnection, 4500);
+      }
+    };
+
+    establishConnection();
+
+    return () => {
+      if (socket) {
+        socket.close();
+      }
+      clearTimeout(reconnectTimeout);
+    };
+  }, []);
+
   // Get current active file object
   const activeFile = files.find(f => f.path === activeFilePath) || null;
+
+  // Sync personal state with peers over WS whenever file focus or cursor shifts
+  useEffect(() => {
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({
+        type: "user:update",
+        payload: {
+          name: myUsername,
+          filePath: activeFilePath,
+          cursor: editorCursor
+        }
+      }));
+    }
+  }, [activeFilePath, editorCursor, myUsername, wsStatus]);
 
   // Run initial or on-change text linter checks
   useEffect(() => {
     if (activeFile && !activeFile.isFolder) {
       const msgs = performLinter(activeFile.name, activeFile.content);
+      // Ensure local state replicates content correctly without circular emits
       setFiles(prev => prev.map(f => f.path === activeFile.path ? { ...f, content: activeFile.content } : f));
       setDiagnostics(msgs);
     } else {
@@ -438,7 +561,20 @@ export default function App() {
   // Content changes
   const handleContentChange = (val: string) => {
     if (!activeFile || activeFile.isFolder) return;
+    
+    // Update local state
     setFiles(prev => prev.map(f => f.path === activeFile.path ? { ...f, content: val } : f));
+
+    // Broadcast change
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({
+        type: "file:change",
+        payload: {
+          filePath: activeFile.path,
+          content: val
+        }
+      }));
+    }
   };
 
   // Interactive Cursor Position calculation
@@ -592,6 +728,20 @@ export default function App() {
     }
   };
 
+  // Broadcast peer message
+  const handleSendChatMessage = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!chatInput.trim()) return;
+    
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({
+        type: "chat:message",
+        payload: { text: chatInput }
+      }));
+      setChatInput("");
+    }
+  };
+
   // Install package simulator
   const handleInstallPackage = async (name: string): Promise<boolean> => {
     if (packages.some(p => p.name.toLowerCase() === name.toLowerCase())) {
@@ -735,6 +885,56 @@ export default function App() {
           <span className="text-[10px] bg-indigo-600/30 text-indigo-300 font-semibold px-2 py-0.5 rounded-full border border-indigo-500/30">
             Silicon Release 1.25
           </span>
+
+          {/* WebSocket Status Badge */}
+          {wsStatus === "connected" && (
+            <span className="flex items-center space-x-1 text-[9px] text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded-full border border-emerald-500/20 font-mono font-medium select-none">
+              <span className="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-ping" />
+              <span>LIVE CLOUD SYNC</span>
+            </span>
+          )}
+          {wsStatus === "connecting" && (
+            <span className="flex items-center space-x-1 text-[9px] text-amber-400 bg-amber-500/10 px-2 py-0.5 rounded-full border border-amber-500/20 font-mono font-medium select-none animate-pulse">
+              <span className="w-1.5 h-1.5 bg-amber-500 rounded-full" />
+              <span>CO-CONNECTING...</span>
+            </span>
+          )}
+          {wsStatus === "disconnected" && (
+            <span className="flex items-center space-x-1 text-[9px] text-rose-400 bg-rose-500/10 px-2 py-0.5 rounded-full border border-rose-500/20 font-mono font-medium select-none">
+              <span className="w-1.5 h-1.5 bg-rose-500 rounded-full" />
+              <span>STANDALONE</span>
+            </span>
+          )}
+
+          {/* Interactive Peer Presence Avatar Circle List */}
+          {collaborativeUsers.length > 0 && (
+            <div className="hidden lg:flex items-center space-x-1 pl-2 border-l border-slate-700/50">
+              <span className="text-[9px] text-slate-500 font-mono mr-1">PEERS:</span>
+              {collaborativeUsers.map(user => {
+                const isSelf = user.id === myUserId;
+                return (
+                  <div
+                    key={user.id}
+                    title={`${user.name}${isSelf ? " (My session)" : ""}${user.filePath ? ` - Editing ${user.filePath}` : " - Standing by"}`}
+                    onClick={() => {
+                      if (user.filePath && !isSelf) {
+                        handleSelectFile(user.filePath);
+                      }
+                    }}
+                    className={`w-5.5 h-5.5 rounded-full flex items-center justify-center text-[8px] font-bold text-white transition-transform hover:scale-115 cursor-pointer relative ${
+                      isSelf ? "ring-1 ring-slate-400 ring-offset-1 ring-offset-slate-900" : ""
+                    }`}
+                    style={{ backgroundColor: user.color }}
+                  >
+                    {user.name.substring(0, 2).toUpperCase()}
+                    {user.filePath && (
+                      <span className="absolute -bottom-0.5 -right-0.5 w-1.5 h-1.5 rounded-full bg-emerald-400 ring-1 ring-slate-950" />
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
 
         {/* Global Toolbar */}
@@ -1016,13 +1216,14 @@ export default function App() {
           </div>
         </div>
 
-        {/* Right Side AI Copilot Intelligence Panel */}
+        {/* Right Side AI Copilot / Co-authors Collaboration Panel */}
         {isCopilotOpen && (
           <div style={{ width: `${copilotWidth}px` }} className="border-l border-[#181a1f] bg-[#21252b] flex flex-col h-full shrink-0 font-sans">
+            {/* Header branding */}
             <div className="flex items-center justify-between px-3 py-2 border-b border-[#181a1f] bg-[#21252b]">
               <div className="flex items-center space-x-2 text-slate-200">
-                <Sparkles className="w-4 h-4 text-amber-400" />
-                <span className="text-xs font-bold uppercase tracking-wider">Atom AI Copilot</span>
+                <Sparkles className="w-4 h-4 text-amber-400 animate-pulse" />
+                <span className="text-xs font-bold uppercase tracking-wider">Atom Peer Studio</span>
               </div>
               <button
                 onClick={() => setIsCopilotOpen(false)}
@@ -1032,77 +1233,253 @@ export default function App() {
               </button>
             </div>
 
-            {/* Conversation list */}
-            <div className="flex-1 overflow-y-auto p-3.5 space-y-4 custom-scrollbar bg-[#1e2229]">
-              {copilotMessages.map((msg, index) => (
-                <div 
-                  key={index}
-                  className={`flex flex-col space-y-1 ${
-                    msg.role === "user" ? "items-end" : "items-start"
-                  }`}
-                >
-                  <span className="text-[10px] text-slate-500 font-semibold font-mono">
-                    {msg.role === "user" ? "YOU" : "ATOM COPILOT"}
-                  </span>
-                  <div 
-                    className={`p-3 rounded-lg text-xs leading-relaxed max-w-[95%] shadow-sm ${
-                      msg.role === "user" 
-                        ? "bg-blue-600/95 text-white" 
-                        : "bg-[#282c34] text-slate-300 border border-slate-800"
-                    }`}
-                  >
-                    {/* Render helper text line-by-line supporting simple code markdown highlight */}
-                    {msg.content.split("\n").map((line, lineIdx) => {
-                      if (line.startsWith("###")) {
-                        return <h4 key={lineIdx} className="font-bold text-white mt-2 first:mt-0 mb-1">{line.slice(3).trim()}</h4>;
-                      }
-                      if (line.startsWith("```")) {
-                        return null; // drop markdown blocks block wrapper inside text rendering
-                      }
-                      if (line.startsWith("- ")) {
-                        return <li key={lineIdx} className="ml-3 list-disc my-0.5">{line.slice(2)}</li>;
-                      }
-                      return <p key={lineIdx} className="my-1 first:mt-0 break-words">{line}</p>;
-                    })}
-                  </div>
-                </div>
-              ))}
-              {isAiLoading && (
-                <div className="flex items-center space-x-2 text-xs text-slate-400 animate-pulse py-2">
-                  <div className="w-2 h-2 bg-amber-400 rounded-full animate-bounce" />
-                  <span>Gemini is synthesizing code...</span>
-                </div>
-              )}
+            {/* Sub Tabs Selector */}
+            <div className="flex border-b border-[#181a1f] bg-slate-950 text-[10px] font-mono leading-none select-none">
+              <button
+                type="button"
+                onClick={() => setActiveCopilotTab("ai")}
+                className={`flex-1 py-2.5 text-center transition tracking-wider ${
+                  activeCopilotTab === "ai"
+                    ? "text-amber-400 bg-[#1e2229] font-bold border-b-2 border-amber-400"
+                    : "text-slate-500 hover:text-slate-300 bg-[#21252b]/50"
+                }`}
+              >
+                🤖 COPILOT AI
+              </button>
+              <button
+                type="button"
+                onClick={() => setActiveCopilotTab("peers")}
+                className={`flex-1 py-2.5 text-center transition tracking-wider flex items-center justify-center space-x-1 ${
+                  activeCopilotTab === "peers"
+                    ? "text-blue-400 bg-[#1e2229] font-bold border-b-2 border-blue-400"
+                    : "text-slate-500 hover:text-slate-300 bg-[#21252b]/50"
+                }`}
+              >
+                <span>👥 SECURE PEERS</span>
+                <span className="px-1.5 py-0.5 rounded-full bg-slate-800 text-[8px] text-slate-300 font-bold border border-slate-700">
+                  {collaborativeUsers.length + 1}
+                </span>
+              </button>
             </div>
 
-            {/* Highlighted text warning indicator */}
-            {selectedCodeSegment && (
-              <div className="bg-slate-900 border-t border-[#181a1f] p-2 text-[10px] text-amber-300 leading-normal font-sans">
-                💡 Selected <strong className="font-mono text-white">{selectedCodeSegment.length} chars</strong> will be included in the next inquiry context.
+            {/* TAB CONTENTS BRANDED AND SPACED ACCORDING TO DESIGN PRINCIPLES */}
+            {activeCopilotTab === "ai" ? (
+              <>
+                {/* Conversation list */}
+                <div className="flex-1 overflow-y-auto p-3.5 space-y-4 custom-scrollbar bg-[#1e2229]">
+                  {copilotMessages.map((msg, index) => (
+                    <div 
+                      key={index}
+                      className={`flex flex-col space-y-1 ${
+                        msg.role === "user" ? "items-end" : "items-start"
+                      }`}
+                    >
+                      <span className="text-[10px] text-slate-500 font-semibold font-mono">
+                        {msg.role === "user" ? "YOU" : "ATOM COPILOT"}
+                      </span>
+                      <div 
+                        className={`p-3 rounded-lg text-xs leading-relaxed max-w-[95%] shadow-sm ${
+                          msg.role === "user" 
+                            ? "bg-blue-600/95 text-white" 
+                            : "bg-[#282c34] text-slate-300 border border-slate-800"
+                        }`}
+                      >
+                        {/* Render helper text line-by-line supporting simple code markdown highlight */}
+                        {msg.content.split("\n").map((line, lineIdx) => {
+                          if (line.startsWith("###")) {
+                            return <h4 key={lineIdx} className="font-bold text-white mt-2 first:mt-0 mb-1">{line.slice(3).trim()}</h4>;
+                          }
+                          if (line.startsWith("```")) {
+                            return null; // drop markdown blocks block wrapper inside text rendering
+                          }
+                          if (line.startsWith("- ")) {
+                            return <li key={lineIdx} className="ml-3 list-disc my-0.5">{line.slice(2)}</li>;
+                          }
+                          return <p key={lineIdx} className="my-1 first:mt-0 break-words">{line}</p>;
+                        })}
+                      </div>
+                    </div>
+                  ))}
+                  {isAiLoading && (
+                    <div className="flex items-center space-x-2 text-xs text-slate-400 animate-pulse py-2">
+                      <div className="w-2 h-2 bg-amber-400 rounded-full animate-bounce" />
+                      <span>Gemini is synthesizing code...</span>
+                    </div>
+                  )}
+                </div>
+
+                {/* Highlighted text warning indicator */}
+                {selectedCodeSegment && (
+                  <div className="bg-slate-900 border-t border-[#181a1f] p-2 text-[10px] text-amber-300 leading-normal font-sans">
+                    💡 Selected <strong className="font-mono text-white">{selectedCodeSegment.length} chars</strong> will be included in the next inquiry context.
+                  </div>
+                )}
+
+                {/* Input box */}
+                <form onSubmit={handleSendCopilotMessage} className="p-2 border-t border-[#181a1f] bg-[#21252b]">
+                  <div className="flex items-center space-x-1.5 bg-slate-950 p-1 rounded-md border border-slate-800">
+                    <input
+                      type="text"
+                      placeholder="Ask Gemini code advice..."
+                      value={copilotInput}
+                      onChange={(e) => setCopilotInput(e.target.value)}
+                      className="w-full bg-transparent text-xs text-white px-2 py-1 outline-none"
+                      id="copilot-input-box"
+                    />
+                    <button
+                      type="submit"
+                      disabled={isAiLoading || !copilotInput.trim()}
+                      className="bg-amber-500 hover:bg-amber-400 text-slate-950 p-1.5 rounded-md transition select-none shrink-0 disabled:bg-slate-800 disabled:text-slate-500 cursor-pointer"
+                      id="copilot-btn-submit"
+                    >
+                      <Sparkles className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                </form>
+              </>
+            ) : (
+              // PEER CLOUD COLLABORATION CHANNEL MODE
+              <div className="flex-1 flex flex-col min-h-0 bg-[#1e2229]">
+                {/* Peer presence status bar */}
+                <div className="p-3 bg-slate-950 border-b border-slate-800 select-none">
+                  <div className="flex items-center justify-between text-[11px] mb-2 font-semibold">
+                    <span className="text-slate-400 font-mono">MY PAIR PROFILE:</span>
+                    <span className="text-emerald-400 text-[10px] font-mono select-none">ID: {myUserId}</span>
+                  </div>
+
+                  {/* Profile Edit Row */}
+                  <div className="flex items-center space-x-2">
+                    <div className="w-6 h-6 rounded-full bg-indigo-500 text-xs font-bold text-white flex items-center justify-center shrink-0">
+                      {myUsername.substring(0, 2).toUpperCase()}
+                    </div>
+                    {isEditingUsername ? (
+                      <div className="flex items-center space-x-1.5 flex-1">
+                        <input
+                          type="text"
+                          value={myUsername}
+                          onChange={(e) => setMyUsername(e.target.value)}
+                          maxLength={20}
+                          className="flex-1 min-w-0 bg-slate-900 border border-slate-700 text-xs text-white px-2 py-1 rounded outline-none"
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") setIsEditingUsername(false);
+                          }}
+                        />
+                        <button
+                          onClick={() => setIsEditingUsername(false)}
+                          className="p-1 bg-emerald-600 hover:bg-emerald-500 text-white rounded cursor-pointer"
+                        >
+                          <Check className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    ) : (
+                      <div className="flex items-center justify-between flex-1">
+                        <span className="text-xs font-semibold text-white truncate max-w-[150px]">{myUsername}</span>
+                        <button
+                          onClick={() => setIsEditingUsername(true)}
+                          className="text-[10px] text-sky-400 hover:text-sky-300 underline font-mono cursor-pointer"
+                        >
+                          Customize
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {/* Connected Roster */}
+                <div className="p-2 border-b border-slate-800 text-[10px] text-slate-500 font-mono uppercase bg-slate-900/40">
+                  CO-AUTHOR DIRECTORY ({collaborativeUsers.length + 1} ONLINE)
+                </div>
+
+                <div className="max-h-48 overflow-y-auto custom-scrollbar p-2.5 space-y-1.5 border-b border-slate-850">
+                  {/* Current client */}
+                  <div className="flex items-center justify-between p-1.5 rounded hover:bg-slate-800/20 text-xs transition">
+                    <div className="flex items-center space-x-2 truncate">
+                      <span className="w-2 h-2 rounded-full bg-emerald-500 inline-block shrink-0" />
+                      <span className="font-semibold text-white truncate">{myUsername} <span className="text-[10px] text-slate-500 font-normal">(Me)</span></span>
+                    </div>
+                    <span className="text-[10px] text-slate-400 font-mono truncate max-w-[100px]">
+                      {activeFilePath === "settings" ? "Settings" : (activeFile ? `/${activeFile.name}` : "Standby")}
+                    </span>
+                  </div>
+
+                  {/* Remote clients */}
+                  {collaborativeUsers.map(peer => (
+                    <div 
+                      key={peer.id} 
+                      onClick={() => peer.filePath && handleSelectFile(peer.filePath)}
+                      className={`flex items-center justify-between p-1.5 rounded hover:bg-slate-800/40 text-xs cursor-pointer transition border border-transparent hover:border-slate-800 ${
+                        peer.filePath ? "border-slate-800/30 bg-slate-900/10" : ""
+                      }`}
+                      title={peer.filePath ? `Click to open active file Buffer: ${peer.filePath}` : "Co-author active"}
+                    >
+                      <div className="flex items-center space-x-2 truncate">
+                        <span className="w-2 h-2 rounded-full inline-block shrink-0" style={{ backgroundColor: peer.color }} />
+                        <span className="font-semibold text-slate-200 truncate">{peer.name}</span>
+                      </div>
+                      <span className="text-[10px] text-indigo-400 hover:underline font-mono truncate max-w-[100px]">
+                        {peer.filePath ? peer.filePath.split("/").pop() : "Standby"}
+                      </span>
+                    </div>
+                  ))}
+
+                  {collaborativeUsers.length === 0 && (
+                    <div className="text-[10px] text-slate-500 italic p-1.5 select-none">
+                      No other co-authors editing currently. Open a new preview browser tab to pairing-code in real-time!
+                    </div>
+                  )}
+                </div>
+
+                {/* Peer Group Chat Room Frame */}
+                <div className="p-2 bg-slate-900/60 border-b border-slate-800 text-[10px] text-slate-500 font-mono uppercase">
+                  CO-CODER STUDIO CHAT
+                </div>
+
+                {/* Messages history */}
+                <div className="flex-1 overflow-y-auto p-3 space-y-2.5 custom-scrollbar bg-slate-950/20 flex flex-col justify-end">
+                  {chatMessages.length === 0 ? (
+                    <div className="text-[11px] text-slate-500 italic text-center py-6 select-none leading-relaxed">
+                      💬 Group pipeline established.<br />Post questions or status updates below for team co-coding logs!
+                    </div>
+                  ) : (
+                    <div className="space-y-2 overflow-y-auto custom-scrollbar pr-1 max-h-full">
+                      {chatMessages.map((msg, idx) => (
+                        <div key={idx} className="text-xs flex flex-col bg-slate-900/30 p-2 rounded border border-slate-900">
+                          <div className="flex items-center justify-between mb-0.5">
+                            <span className="font-bold pr-2" style={{ color: msg.color }}>
+                              {msg.sender}
+                            </span>
+                            <span className="text-[9px] text-slate-500 font-mono">
+                              {new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                            </span>
+                          </div>
+                          <p className="text-slate-300 break-words leading-snug">{msg.text}</p>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                {/* Sender form */}
+                <form onSubmit={handleSendChatMessage} className="p-2 border-t border-slate-800 bg-slate-900/80 shrink-0">
+                  <div className="flex items-center space-x-1.5 bg-slate-950 p-1 rounded border border-slate-750">
+                    <input
+                      type="text"
+                      placeholder="Type co-coder notes..."
+                      value={chatInput}
+                      onChange={(e) => setChatInput(e.target.value)}
+                      className="w-full bg-transparent text-xs text-slate-200 px-2 py-1 outline-none"
+                    />
+                    <button
+                      type="submit"
+                      disabled={!chatInput.trim()}
+                      className="bg-blue-600 hover:bg-blue-500 text-white px-2 py-1 rounded text-[10px] font-bold select-none cursor-pointer disabled:opacity-40"
+                    >
+                      Send
+                    </button>
+                  </div>
+                </form>
               </div>
             )}
-
-            {/* Input box */}
-            <form onSubmit={handleSendCopilotMessage} className="p-2 border-t border-[#181a1f], bg-[#21252b]">
-              <div className="flex items-center space-x-1.5 bg-slate-950 p-1 rounded-md border border-slate-800">
-                <input
-                  type="text"
-                  placeholder="Ask Gemini code advice..."
-                  value={copilotInput}
-                  onChange={(e) => setCopilotInput(e.target.value)}
-                  className="w-full bg-transparent text-xs text-white px-2 py-1 outline-none"
-                  id="copilot-input-box"
-                />
-                <button
-                  type="submit"
-                  disabled={isAiLoading || !copilotInput.trim()}
-                  className="bg-amber-500 hover:bg-amber-400 text-slate-950 p-1.5 rounded-md transition select-none shrink-0 disabled:bg-slate-800 disabled:text-slate-500 cursor-pointer"
-                  id="copilot-btn-submit"
-                >
-                  <Sparkles className="w-3.5 h-3.5" />
-                </button>
-              </div>
-            </form>
           </div>
         )}
       </div>
