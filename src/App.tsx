@@ -20,12 +20,24 @@ import {
   Eye, 
   RefreshCw,
   Code,
-  ArrowRightLeft
+  ArrowRightLeft,
+  GitBranch,
+  Github,
+  ExternalLink,
+  Lock,
+  Globe,
+  Share2,
+  Database,
+  Binary,
+  FileCode
 } from "lucide-react";
 import FileTree from "./components/FileTree";
 import CommandPalette from "./components/CommandPalette";
 import SettingsView from "./components/SettingsView";
 import FindReplace from "./components/FindReplace";
+import CircuitPythonConsole from "./components/CircuitPythonConsole";
+import HighlightedEditor from "./components/HighlightedEditor";
+import HexEditor from "./components/HexEditor";
 import { 
   VirtualFile, 
   AtomTheme, 
@@ -102,7 +114,39 @@ Welcome to the highest-fidelity web clone of the legendary **Atom IDE**!
 3. **Advanced Linter Diagnostics**: Instant script diagnostics searching for basic syntax gaps, brackets balance, or semicolon inconsistencies.
 4. **Command Palette**: Leverage the system command palette (\`Ctrl+Shift+P\` or clicking the bottom-right selector) to search commands.
 5. **AI Coding Copilot**: Ask Gemini to optimize or write code in real-time, plus a premium **AI Auto-Fix** to fix linter issues automatically!
-` }
+` },
+  { path: "/code.py", name: "code.py", isFolder: false, content: `# CircuitPython NeoPixel Rainbow and Pin Read Demo
+import time
+import board
+import neopixel
+import analogio
+import digitalio
+
+# Setup NeoPixel RGB LED on board pin
+pixel = neopixel.NeoPixel(board.NEOPIXEL, 1, brightness=0.5)
+
+# Setup push button (GP2 pin pull-up resistor)
+button = digitalio.DigitalInOut(board.GP2)
+button.direction = digitalio.Direction.INPUT
+button.pull = digitalio.Pull.UP
+
+print("CircuitPython active! NeoPixel ready.")
+
+while True:
+    # Read button GP2 state
+    if not button.value:
+         print("Button GP2 pressed! Changing NeoPixel color.")
+         pixel.fill((255, 0, 127)) # Neon Pink
+         time.sleep(0.5)
+    else:
+         # Fade NeoPixel colors
+         for color in [(255, 0, 0), (0, 255, 0), (0, 0, 255)]:
+              pixel.fill(color)
+              print("Cycling color stream...")
+              time.sleep(1.0)
+` },
+  { path: "/assets", name: "assets", isFolder: true, content: "", isOpen: true },
+  { path: "/assets/firmware.bin", name: "firmware.bin", isFolder: false, content: "\x7FELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3E\x00\x01\x00\x00\x00\x78\x00\x40\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00Compiled ELF64 Web IDE Header. Greetings from modern Hex Viewer and Interactive Struct Inspector!" }
 ];
 
 const INITIAL_PACKAGES: AtomPackage[] = [
@@ -127,6 +171,7 @@ export default function App() {
   const [tabLength, setTabLength] = useState<number>(2);
   const [wordWrap, setWordWrap] = useState<boolean>(true);
   const [editorCursor, setEditorCursor] = useState({ line: 1, col: 1 });
+  const [editorMode, setEditorMode] = useState<"text" | "hex">("text");
   
   // Find & Replace State
   const [findReplaceOpen, setFindReplaceOpen] = useState(false);
@@ -171,7 +216,90 @@ export default function App() {
   const [collaborativeUsers, setCollaborativeUsers] = useState<CollaborativeUser[]>([]);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [chatInput, setChatInput] = useState("");
-  const [activeCopilotTab, setActiveCopilotTab] = useState<"ai" | "peers">("ai");
+  const [activeCopilotTab, setActiveCopilotTab] = useState<"ai" | "peers" | "github" | "circuitpython">("ai");
+
+  // GitHub Integration State
+  const [githubToken, setGithubToken] = useState<string | null>(() => localStorage.getItem("atom_github_token"));
+  const [githubUser, setGithubUser] = useState<any>(null);
+  const [githubRepos, setGithubRepos] = useState<any[]>([]);
+  const [selectedRepo, setSelectedRepo] = useState<string>("");
+  const [repoBranch, setRepoBranch] = useState<string>("main");
+  const [commitMessage, setCommitMessage] = useState<string>("Update file code via Atom Workspace");
+  const [githubLoading, setGithubLoading] = useState<boolean>(false);
+  const [gistPublic, setGistPublic] = useState<boolean>(true);
+  const [githubStatusMsg, setGithubStatusMsg] = useState<{ type: "success" | "error" | "info"; text: string } | null>(null);
+
+  // Sync profile details if token changes
+  useEffect(() => {
+    if (!githubToken) {
+      setGithubUser(null);
+      setGithubRepos([]);
+      return;
+    }
+
+    const fetchGitHubData = async () => {
+      setGithubLoading(true);
+      try {
+        const userRes = await fetch("/api/github/user", {
+          headers: { "X-GitHub-Token": githubToken }
+        });
+        if (userRes.ok) {
+          const uData = await userRes.json();
+          setGithubUser(uData);
+        } else {
+          throw new Error("Failed to fetch GitHub profile");
+        }
+
+        const repoRes = await fetch("/api/github/repos", {
+          headers: { "X-GitHub-Token": githubToken }
+        });
+        if (repoRes.ok) {
+          const rData = await repoRes.json();
+          setGithubRepos(rData);
+          if (rData.length > 0) {
+            setSelectedRepo(rData[0].full_name || "");
+          }
+        }
+      } catch (err: any) {
+        console.error("Failed to load GitHub credentials:", err);
+        setGithubToken(null);
+        localStorage.removeItem("atom_github_token");
+        setGithubStatusMsg({ type: "error", text: "GitHub credentials expired or invalid. Profile disconnected." });
+      } finally {
+        setGithubLoading(false);
+      }
+    };
+
+    fetchGitHubData();
+  }, [githubToken]);
+
+  // Listener to receive OAuth Token callback from popup
+  useEffect(() => {
+    const handleGitHubOAuthMessage = (event: MessageEvent) => {
+      const origin = event.origin;
+      if (!origin.endsWith(".run.app") && !origin.includes("localhost") && !origin.includes("127.0.0.1")) {
+        return;
+      }
+
+      if (event.data?.type === "OAUTH_AUTH_SUCCESS") {
+        const token = event.data.token;
+        if (token) {
+          localStorage.setItem("atom_github_token", token);
+          setGithubToken(token);
+          setGithubStatusMsg({
+            type: "success",
+            text: event.data.isDemo 
+              ? "Connected in Demo Mode! (Client credentials are empty in your secrets panel)" 
+              : "Successfully authenticated with real GitHub account!"
+          });
+          setActiveCopilotTab("github");
+        }
+      }
+    };
+
+    window.addEventListener("message", handleGitHubOAuthMessage);
+    return () => window.removeEventListener("message", handleGitHubOAuthMessage);
+  }, []);
 
   const wsRef = useRef<WebSocket | null>(null);
 
@@ -363,6 +491,31 @@ export default function App() {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, []);
 
+  const isBinaryFile = (name: string, content?: string): boolean => {
+    const binaryExtensions = [".bin", ".exe", ".wasm", ".pyc", ".dat", ".png", ".jpg", ".gif", ".ico", ".pdf", ".zip", ".tar", ".gz", ".o", ".class"];
+    const ext = name.toLowerCase().slice(name.lastIndexOf("."));
+    if (binaryExtensions.includes(ext)) return true;
+    
+    if (content) {
+      const chunk = content.slice(0, 100);
+      for (let i = 0; i < chunk.length; i++) {
+        const code = chunk.charCodeAt(i);
+        if (code === 0 || (code < 32 && code !== 9 && code !== 10 && code !== 13)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  };
+
+  // Synchronously switch to Hex mode for binary files or text mode for text files
+  useEffect(() => {
+    if (activeFile) {
+      const isBin = isBinaryFile(activeFile.name, activeFile.content);
+      setEditorMode(isBin ? "hex" : "text");
+    }
+  }, [activeFilePath]);
+
   // Simple offline parser mimicking real coding guidelines
   const performLinter = (name: string, content: string): LinterMessage[] => {
     const messages: LinterMessage[] = [];
@@ -370,10 +523,51 @@ export default function App() {
 
     const isJS = name.endsWith(".js") || name.endsWith(".jsx") || name.endsWith(".ts") || name.endsWith(".tsx");
     const isHTML = name.endsWith(".html");
+    const isPy = name.endsWith(".py");
 
     lines.forEach((line, idx) => {
       const lineNum = idx + 1;
       
+      if (isPy) {
+        const trimmed = line.trim();
+        if ((trimmed.startsWith("if ") || trimmed.startsWith("elif ") || trimmed.startsWith("while ") || trimmed.startsWith("for ") || trimmed.startsWith("def ")) && !trimmed.endsWith(":")) {
+          messages.push({
+            line: lineNum,
+            column: line.length || 1,
+            severity: "error",
+            message: "Python formatting: Missing colon (:) at the end of declaration control statement.",
+            source: "PyLint"
+          });
+        }
+        if (line.includes("\t") && line.includes(" ")) {
+          messages.push({
+            line: lineNum,
+            column: 1,
+            severity: "error",
+            message: "Python fatal: Tab and Space characters mixed for indentation. Rely entirely on spaces.",
+            source: "PyLint"
+          });
+        }
+        if (line.includes("board.") && !content.includes("import board")) {
+          messages.push({
+            line: lineNum,
+            column: line.indexOf("board.") + 1,
+            severity: "warning",
+            message: "Property 'board' referenced but 'import board' is missing in the file header.",
+            source: "PyLint"
+          });
+        }
+        if (line.includes("neopixel.") && !content.includes("import neopixel")) {
+          messages.push({
+            line: lineNum,
+            column: line.indexOf("neopixel.") + 1,
+            severity: "warning",
+            message: "Property 'neopixel' referenced but 'import neopixel' is missing in the file header.",
+            source: "PyLint"
+          });
+        }
+      }
+
       if (isJS) {
         // Look for alert calls - usually deprecated in clean code guidelines
         if (line.includes("alert(")) {
@@ -742,6 +936,164 @@ export default function App() {
     }
   };
 
+  // Connect to GitHub OAuth flow popup directly
+  const handleConnectGitHub = async () => {
+    try {
+      setGithubLoading(true);
+      setGithubStatusMsg({ type: "info", text: "Opening GitHub Connection Tunnel..." });
+      
+      const response = await fetch("/api/auth/github/url");
+      if (!response.ok) {
+        throw new Error("Failed to contact local authorization tunnel");
+      }
+      
+      const { url } = await response.json();
+      
+      const width = 600;
+      const height = 700;
+      const left = window.screen.width / 2 - width / 2;
+      const top = window.screen.height / 2 - height / 2;
+      
+      const authWindow = window.open(
+        url,
+        "github_oauth_popup",
+        `width=${width},height=${height},top=${top},left=${left},scrollbars=yes,resizable=yes`
+      );
+
+      if (!authWindow) {
+        setGithubStatusMsg({ 
+          type: "error", 
+          text: "Web Browser blocked the authentication popup. Please allow popups for this origin!" 
+        });
+      }
+    } catch (err: any) {
+      console.error("OAuth init error:", err);
+      setGithubStatusMsg({ type: "error", text: `Auth tunnel initiation failed: ${err.message}` });
+    } finally {
+      setGithubLoading(false);
+    }
+  };
+
+  // Disconnect GitHub context
+  const handleDisconnectGitHub = () => {
+    localStorage.removeItem("atom_github_token");
+    setGithubToken(null);
+    setGithubUser(null);
+    setGithubRepos([]);
+    setSelectedRepo("");
+    setGithubStatusMsg({ type: "info", text: "GitHub credentials removed from browser localStorage." });
+  };
+
+  // Commit and Push currently active file to selected repo
+  const handlePushActiveFile = async () => {
+    if (!githubToken) {
+      setGithubStatusMsg({ type: "error", text: "Please authorize your profile first!" });
+      return;
+    }
+
+    if (!activeFile || activeFile.isFolder) {
+      setGithubStatusMsg({ type: "error", text: "No active file buffer context selected in the editor." });
+      return;
+    }
+
+    if (!selectedRepo) {
+      setGithubStatusMsg({ type: "error", text: "A target GitHub repository must be selected from the drop-down list." });
+      return;
+    }
+
+    setGithubLoading(true);
+    setGithubStatusMsg({ type: "info", text: `Synthesizing staging & pushing ${activeFile.name}...` });
+
+    try {
+      const res = await fetch("/api/github/push", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-GitHub-Token": githubToken
+        },
+        body: JSON.stringify({
+          repo: selectedRepo,
+          path: activeFile.path,
+          content: activeFile.content,
+          message: commitMessage,
+          branch: repoBranch
+        })
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || "GitHub commit action failed.");
+      }
+
+      setGithubStatusMsg({
+        type: "success",
+        text: data.demo 
+          ? `[Demo Connected] Successfully committed ${activeFile.name} to ${selectedRepo} (${repoBranch})`
+          : `Pushed successfully! Commit SHA: ${data.commit?.sha?.substring(0, 7) || "N/A"}.`
+      });
+    } catch (err: any) {
+      console.error("GitHub Push error:", err);
+      setGithubStatusMsg({ type: "error", text: `Push rejected: ${err.message}` });
+    } finally {
+      setGithubLoading(false);
+    }
+  };
+
+  // Publish currently active file as a safe single Gist
+  const handlePublishGist = async () => {
+    if (!githubToken) {
+      setGithubStatusMsg({ type: "error", text: "Please connect your profile identity first!" });
+      return;
+    }
+
+    if (!activeFile || activeFile.isFolder) {
+      setGithubStatusMsg({ type: "error", text: "Select an active text or code buffer to compile into Gist." });
+      return;
+    }
+
+    setGithubLoading(true);
+    setGithubStatusMsg({ type: "info", text: `Uploading dynamic gist payloads to GitHub...` });
+
+    try {
+      const res = await fetch("/api/github/gists", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-GitHub-Token": githubToken
+        },
+        body: JSON.stringify({
+          description: `Gist of ${activeFile.name} published via full-fidelity Atom Workspace`,
+          isPublic: gistPublic,
+          files: {
+            [activeFile.name]: {
+              content: activeFile.content
+            }
+          }
+        })
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || "GitHub Gist pipeline rejected.");
+      }
+
+      setGithubStatusMsg({
+        type: "success",
+        text: `Gist Published! URL: ${data.html_url}`
+      });
+      
+      // Auto-open if browser safety policies match
+      if (data.html_url && !data.demo) {
+        window.open(data.html_url, "_blank");
+      }
+    } catch (err: any) {
+      console.error("Gist error:", err);
+      setGithubStatusMsg({ type: "error", text: `Gist publish rejected: ${err.message}` });
+    } finally {
+      setGithubLoading(false);
+    }
+  };
+
   // Install package simulator
   const handleInstallPackage = async (name: string): Promise<boolean> => {
     if (packages.some(p => p.name.toLowerCase() === name.toLowerCase())) {
@@ -1075,6 +1427,35 @@ export default function App() {
                     </span>
                     <span>• {activeFile.content.length.toLocaleString()} characters</span>
                     <span>• {activeFile.content.split("\n").length} rows</span>
+
+                    {/* Editor Mode Selector */}
+                    <div className="flex items-center space-x-1 pl-3 border-l border-slate-850/80 ml-3 shrink-0">
+                      <button
+                        onClick={() => setEditorMode("text")}
+                        className={`px-2 py-0.5 rounded text-[10px] font-bold transition flex items-center space-x-1 cursor-pointer ${
+                          editorMode === "text" 
+                            ? "bg-slate-800/90 text-sky-400 border border-slate-700/50" 
+                            : "hover:bg-slate-800/40 text-slate-500"
+                        }`}
+                        title="Display raw text/source code with syntax colors"
+                      >
+                        <FileCode className="w-3 h-3" />
+                        <span>Text Editor</span>
+                      </button>
+                      
+                      <button
+                        onClick={() => setEditorMode("hex")}
+                        className={`px-2 py-0.5 rounded text-[10px] font-bold transition flex items-center space-x-1 cursor-pointer ${
+                          editorMode === "hex" 
+                            ? "bg-slate-800/90 text-yellow-500 border border-slate-700/50" 
+                            : "hover:bg-slate-800/40 text-slate-500"
+                        }`}
+                        title="Inspect file as raw hexadecimal byte array blocks using Binary Hex Editor"
+                      >
+                        <Binary className="w-3 h-3" />
+                        <span>Hex Editor</span>
+                      </button>
+                    </div>
                   </div>
 
                   <div className="flex items-center space-x-3 text-slate-500">
@@ -1092,29 +1473,41 @@ export default function App() {
                 {/* Integrated custom editor screen */}
                 <div className="flex-1 flex overflow-hidden min-h-0">
                   {/* Number lines helper gutter */}
-                  <div className={`w-12 pt-4 px-2 select-none text-right font-mono text-[11px] leading-relaxed shrink-0 border-r ${style.border} bg-[#282c34]/20 text-slate-600`}>
-                    {activeFile.content.split("\n").map((_, i) => (
-                      <div key={i} className="h-5 overflow-hidden">
-                        {i + 1}
-                      </div>
-                    ))}
-                  </div>
+                  {editorMode === "text" && (
+                    <div className={`w-12 pt-4 px-2 select-none text-right font-mono text-[11px] leading-relaxed shrink-0 border-r ${style.border} bg-[#282c34]/20 text-slate-600`}>
+                      {activeFile.content.split("\n").map((_, i) => (
+                        <div key={i} className="h-5 overflow-hidden">
+                          {i + 1}
+                        </div>
+                      ))}
+                    </div>
+                  )}
 
                   {/* Standard user input textarea with Atom styled fonts */}
                   <div className="flex-1 relative min-w-0">
-                    <textarea
-                      ref={textareaRef}
-                      value={activeFile.content}
-                      onChange={(e) => handleContentChange(e.target.value)}
-                      onSelect={handleTextareaSelect}
-                      className={`absolute inset-0 w-full h-full p-4 resize-none leading-relaxed outline-none border-none select-text ${fontFamily} ${style.textareaBg} ${style.textareaText}`}
-                      style={{ 
-                        fontSize: `${fontSize}px`, 
-                        tabSize: tabLength,
-                        whiteSpace: wordWrap ? "pre-wrap" : "pre"
-                      }}
-                      id="editor-workspace-textarea"
-                    />
+                    {editorMode === "hex" ? (
+                      <HexEditor
+                        value={activeFile.content}
+                        onChange={handleContentChange}
+                        theme={theme}
+                        style={style}
+                        fileName={activeFile.name}
+                      />
+                    ) : (
+                      <HighlightedEditor
+                        value={activeFile.content}
+                        onChange={handleContentChange}
+                        onSelect={handleTextareaSelect}
+                        fontFamily={fontFamily}
+                        fontSize={fontSize}
+                        tabLength={tabLength}
+                        wordWrap={wordWrap}
+                        theme={theme}
+                        style={style}
+                        textareaRef={textareaRef}
+                        fileName={activeFile.name}
+                      />
+                    )}
                   </div>
                 </div>
 
@@ -1260,10 +1653,35 @@ export default function App() {
                   {collaborativeUsers.length + 1}
                 </span>
               </button>
+              <button
+                type="button"
+                onClick={() => setActiveCopilotTab("github")}
+                className={`flex-1 py-2.5 text-center transition tracking-wider flex items-center justify-center space-x-1 ${
+                  activeCopilotTab === "github"
+                    ? "text-emerald-400 bg-[#1e2229] font-bold border-b-2 border-emerald-400"
+                    : "text-slate-500 hover:text-slate-300 bg-[#21252b]/50"
+                }`}
+              >
+                <span>🐙 GITHUB</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setActiveCopilotTab("circuitpython");
+                  setCopilotWidth(360); // expand sidebar dynamically for visualizer UI
+                }}
+                className={`flex-1 py-2.5 text-center transition tracking-wider flex items-center justify-center space-x-1 ${
+                  activeCopilotTab === "circuitpython"
+                    ? "text-yellow-400 bg-[#1e2229] font-bold border-b-2 border-yellow-400"
+                    : "text-slate-500 hover:text-slate-300 bg-[#21252b]/50"
+                }`}
+              >
+                <span>⚡ CIRCUITPY</span>
+              </button>
             </div>
 
             {/* TAB CONTENTS BRANDED AND SPACED ACCORDING TO DESIGN PRINCIPLES */}
-            {activeCopilotTab === "ai" ? (
+            {activeCopilotTab === "ai" && (
               <>
                 {/* Conversation list */}
                 <div className="flex-1 overflow-y-auto p-3.5 space-y-4 custom-scrollbar bg-[#1e2229]">
@@ -1337,7 +1755,9 @@ export default function App() {
                   </div>
                 </form>
               </>
-            ) : (
+            )}
+
+            {activeCopilotTab === "peers" && (
               // PEER CLOUD COLLABORATION CHANNEL MODE
               <div className="flex-1 flex flex-col min-h-0 bg-[#1e2229]">
                 {/* Peer presence status bar */}
@@ -1449,7 +1869,7 @@ export default function App() {
                               {msg.sender}
                             </span>
                             <span className="text-[9px] text-slate-500 font-mono">
-                              {new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                              {new Date(msg.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}
                             </span>
                           </div>
                           <p className="text-slate-300 break-words leading-snug">{msg.text}</p>
@@ -1479,6 +1899,231 @@ export default function App() {
                   </div>
                 </form>
               </div>
+            )}
+
+            {activeCopilotTab === "github" && (
+              // ========= GITHUB CONTROL PANEL VIEW =========
+              <div className="flex-1 flex flex-col min-h-0 bg-[#1e2229] overflow-y-auto custom-scrollbar">
+                {/* Warning message notification banner */}
+                {githubStatusMsg && (
+                  <div className={`p-3 text-[11px] font-sans flex items-start space-x-2 border-b select-none shrink-0 ${
+                    githubStatusMsg.type === "success" ? "bg-emerald-950/80 text-emerald-300 border-emerald-900" :
+                    githubStatusMsg.type === "error" ? "bg-rose-950/80 text-rose-300 border-rose-900" :
+                    "bg-slate-900 text-sky-300 border-slate-850"
+                  }`}>
+                    <span className="w-1.5 h-1.5 bg-current rounded-full mt-1.5 shrink-0" />
+                    <span className="flex-1 leading-normal">{githubStatusMsg.text}</span>
+                    <button 
+                      onClick={() => setGithubStatusMsg(null)}
+                      className="text-slate-400 hover:text-white font-bold cursor-pointer transition select-none"
+                    >
+                      ×
+                    </button>
+                  </div>
+                )}
+
+                {!githubToken ? (
+                  // NOT CONNECTED VIEW
+                  <div className="p-4 space-y-4">
+                    <div className="bg-slate-950/50 p-4 rounded-lg border border-slate-800 text-center flex flex-col items-center">
+                      <div className="w-12 h-12 rounded-full bg-slate-900 flex items-center justify-center text-slate-300 mb-2 border border-slate-800">
+                        <Github className="w-6 h-6" />
+                      </div>
+                      <h3 className="text-xs font-bold text-slate-200 uppercase tracking-wide">Connect GitHub Profile</h3>
+                      <p className="text-[11px] text-slate-400 mt-1 leading-normal max-w-[220px]">
+                        Publish active project code directly to public/secret repositories or publish gists from your editor panel.
+                      </p>
+                      
+                      <button
+                        onClick={handleConnectGitHub}
+                        disabled={githubLoading}
+                        className="w-full mt-4 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:bg-slate-800 disabled:text-slate-500 text-slate-950 font-bold text-[11px] rounded transition flex items-center justify-center space-x-2 select-none cursor-pointer"
+                      >
+                        {githubLoading ? (
+                          <>
+                            <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                            <span>CONNECTING...</span>
+                          </>
+                        ) : (
+                          <>
+                            <Github className="w-3.5 h-3.5 fill-current" />
+                            <span>CONNECT GITHUB ACCOUNT</span>
+                          </>
+                        )}
+                      </button>
+                    </div>
+
+                    {/* Step-by-Step credential checklist */}
+                    <div className="bg-slate-900/30 p-3.5 rounded-lg border border-slate-850/60 text-[11px] text-slate-400 leading-relaxed font-sans space-y-2">
+                      <span className="text-[10px] font-mono text-slate-500 font-bold uppercase block tracking-wider font-semibold">🛠️ Real vs Demo Mode</span>
+                      <p>
+                        If your AI Studio Secrets are missing <strong className="text-slate-200 font-mono">GITHUB_CLIENT_ID</strong>, clicking connect operates safely in a high-fidelity <strong>Demo Sandbox Mode</strong>.
+                      </p>
+                      <hr className="border-slate-800" />
+                      <span className="text-[10px] font-mono text-slate-500 font-bold uppercase block tracking-wider font-semibold">🔒 Real Connection Setup:</span>
+                      <ol className="list-decimal pl-4.5 space-y-1">
+                        <li>Register an OAuth app in GitHub settings.</li>
+                        <li>Set Callback URL to match your app domain Callback path.</li>
+                        <li>Verify credentials inside AI Studio Secrets panel.</li>
+                      </ol>
+                    </div>
+                  </div>
+                ) : (
+                  // SUCCESSFULLY CONNECTED VIEW WITH REPO & GIST CONTROLS
+                  <div className="flex-1 flex flex-col min-h-0 divide-y divide-[#181a1f]">
+                    {/* Logged user profile badge */}
+                    <div className="p-3 bg-slate-950/60 shrink-0 flex items-center justify-between">
+                      {githubUser ? (
+                        <div className="flex items-center space-x-2.5 min-w-0">
+                          <img 
+                            src={githubUser.avatar_url} 
+                            alt="GitHub User Avatar" 
+                            className="w-8 h-8 rounded-full border border-slate-800 shrink-0 select-none"
+                            referrerPolicy="no-referrer"
+                          />
+                          <div className="min-w-0">
+                            <h4 className="text-xs font-bold text-slate-100 truncate">{githubUser.name || githubUser.login}</h4>
+                            <p className="text-[10px] font-mono text-slate-400 truncate">@{githubUser.login}</p>
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="flex items-center space-x-2 animate-pulse">
+                          <div className="w-8 h-8 rounded-full bg-slate-800" />
+                          <div className="space-y-1">
+                            <div className="w-20 h-2 bg-slate-800 rounded" />
+                            <div className="w-12 h-1.5 bg-slate-800 rounded" />
+                          </div>
+                        </div>
+                      )}
+
+                      <button
+                        onClick={handleDisconnectGitHub}
+                        className="text-[10px] bg-slate-905 hover:bg-slate-900 border border-slate-800 hover:border-slate-700 px-2 py-1 text-slate-400 hover:text-rose-400 font-semibold rounded transition cursor-pointer"
+                      >
+                        Sign Out
+                      </button>
+                    </div>
+
+                    {/* Module Push Panel to write files to repos */}
+                    <div className="p-3.5 space-y-3.5">
+                      <div className="flex items-center justify-between text-[10px] font-mono text-slate-400 select-none uppercase font-bold tracking-wider font-semibold">
+                        <span>🐙 COMMIT & PUSH BUFFER</span>
+                        {githubLoading && <RefreshCw className="w-3" />}
+                      </div>
+
+                      {/* Dropdown repositories selectors */}
+                      <div className="space-y-1.5">
+                        <label className="text-[11px] text-slate-300 font-sans block font-semibold select-none">Select Target Repository:</label>
+                        <select
+                          value={selectedRepo}
+                          onChange={(e) => setSelectedRepo(e.target.value)}
+                          disabled={githubRepos.length === 0 || githubLoading}
+                          className="w-full bg-slate-950 border border-slate-800 py-1.5 px-2.5 rounded text-xs text-slate-200 outline-none select-none disabled:opacity-50"
+                        >
+                          {githubRepos.length === 0 ? (
+                            <option>No repositories found</option>
+                          ) : (
+                            githubRepos.map(repo => (
+                              <option key={repo.id} value={repo.full_name}>
+                                {repo.full_name}
+                              </option>
+                            ))
+                          )}
+                        </select>
+                      </div>
+
+                      {/* Active File and Branch Configs inside grid fields */}
+                      <div className="grid grid-cols-2 gap-2 text-xs">
+                        <div>
+                          <label className="text-[10px] text-slate-400 uppercase font-bold tracking-wider font-mono block select-none">Active File:</label>
+                          <div className="bg-slate-950/60 p-1.5 border border-slate-850/80 rounded leading-none text-slate-200 truncate mt-1">
+                            {activeFile ? activeFile.name : "(none)"}
+                          </div>
+                        </div>
+
+                        <div>
+                          <label className="text-[10px] text-slate-400 uppercase font-bold tracking-wider font-mono block select-none">Target Branch:</label>
+                          <input
+                            type="text"
+                            value={repoBranch}
+                            onChange={(e) => setRepoBranch(e.target.value)}
+                            disabled={githubLoading}
+                            className="w-full bg-slate-950 border border-slate-800 rounded p-1 text-xs text-slate-200 outline-none truncate mt-1"
+                          />
+                        </div>
+                      </div>
+
+                      {/* Custom Commit message inputs */}
+                      <div className="space-y-1">
+                        <label className="text-[11px] text-slate-300 font-sans block font-semibold select-none">Commit Message:</label>
+                        <input
+                          type="text"
+                          value={commitMessage}
+                          onChange={(e) => setCommitMessage(e.target.value)}
+                          disabled={githubLoading}
+                          className="w-full bg-slate-950 border border-slate-800 rounded py-1.5 px-2.5 text-xs text-slate-200 outline-none"
+                        />
+                      </div>
+
+                      {/* Push Trigger Button */}
+                      <button
+                        onClick={handlePushActiveFile}
+                        disabled={githubLoading || !activeFile || activeFile.isFolder || !selectedRepo}
+                        className="w-full py-2 bg-emerald-600 hover:bg-emerald-500 disabled:bg-slate-800 disabled:text-slate-500 text-slate-950 rounded text-xs font-mono font-bold select-none cursor-pointer flex items-center justify-center space-x-1.5 shadow"
+                      >
+                        <GitBranch className="w-3.5 h-3.5" />
+                        <span>STAGE & PUSH TO GITHUB</span>
+                      </button>
+                    </div>
+
+                    {/* Module 2: Share and publish single file Gist */}
+                    <div className="p-3.5 space-y-3.5 bg-slate-900/10">
+                      <div className="text-[10px] font-mono text-slate-400 select-none uppercase font-bold tracking-wider block font-semibold">
+                        <span>SHARES & PUBLIC GISTS</span>
+                      </div>
+
+                      <div className="bg-slate-950/35 p-2.5 rounded border border-slate-850/55 flex items-center justify-between font-sans">
+                        <div className="space-y-0.5">
+                          <span className="text-xs font-semibold text-slate-200 flex items-center gap-1">
+                            {gistPublic ? <Globe className="w-3 h-3 text-sky-400" /> : <Lock className="w-3 h-3 text-slate-500" />}
+                            {gistPublic ? "Public Gist" : "Secret Gist"}
+                          </span>
+                          <p className="text-[10px] text-slate-100/50 select-none">Make code searchable on Gist index</p>
+                        </div>
+
+                        <button
+                          onClick={() => setGistPublic(!gistPublic)}
+                          className={`text-[10px] border px-2.5 py-1 font-mono rounded transition cursor-pointer font-bold ${
+                            gistPublic 
+                              ? "bg-slate-900 text-sky-400 border-sky-950 hover:bg-slate-850" 
+                              : "bg-slate-950 text-slate-400 border-slate-800 hover:bg-slate-900"
+                          }`}
+                        >
+                          Toggle
+                        </button>
+                      </div>
+
+                      <button
+                        onClick={handlePublishGist}
+                        disabled={githubLoading || !activeFile || activeFile.isFolder}
+                        className="w-full py-2 bg-[#2d333b] hover:bg-[#3c444d] border border-slate-705 text-slate-200 rounded text-xs font-mono font-bold select-none cursor-pointer flex items-center justify-center space-x-1.5"
+                      >
+                        <Share2 className="w-3.5 h-3.5 text-indigo-400 animate-pulse" />
+                        <span>PUBLISH SINGLE-FILE GIST</span>
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {activeCopilotTab === "circuitpython" && (
+              <CircuitPythonConsole
+                activeFile={activeFile}
+                files={files}
+                setFiles={setFiles}
+                setActiveFilePath={setActiveFilePath}
+              />
             )}
           </div>
         )}

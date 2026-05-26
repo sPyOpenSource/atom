@@ -126,6 +126,348 @@ app.post("/api/copilot/autofix", async (req, res) => {
   }
 });
 
+// ==========================================
+// GitHub OAuth & Proxy Endpoints Group
+// ==========================================
+
+// Helper to construct GitHub API headers
+function getGitHubHeaders(token: string) {
+  return {
+    "Authorization": `Bearer ${token}`,
+    "User-Agent": "Atom-IDE-Clone",
+    "Accept": "application/vnd.github.v3+json",
+    "Content-Type": "application/json"
+  };
+}
+
+// 1. Get OAuth login URL or check configuration status
+app.get("/api/auth/github/url", (req, res) => {
+  const clientId = process.env.GITHUB_CLIENT_ID;
+  const isConfigured = !!clientId && !!process.env.GITHUB_CLIENT_SECRET;
+
+  const protocol = req.headers["x-forwarded-proto"] || "http";
+  const host = req.headers.host || "localhost:3000";
+  const defaultAppUrl = `${protocol}://${host}`;
+  const appUrl = (process.env.APP_URL || defaultAppUrl).replace(/\/$/, "");
+  const redirectUri = `${appUrl}/auth/github/callback`;
+
+  if (!isConfigured) {
+    return res.json({
+      configured: false,
+      url: `/auth/github/callback?code=demo_auth_code_98765`,
+      redirectUri: redirectUri
+    });
+  }
+
+  const state = Math.random().toString(36).substring(2, 15);
+  const params = new URLSearchParams({
+    client_id: clientId!,
+    redirect_uri: redirectUri,
+    scope: "repo,gist,read:user",
+    state: state
+  });
+
+  res.json({
+    configured: true,
+    url: `https://github.com/login/oauth/authorize?${params.toString()}`,
+    redirectUri: redirectUri
+  });
+});
+
+// 2. OAuth Redirect Callback Handler (with Demo connection safe fallback)
+app.get(["/auth/github/callback", "/auth/github/callback/"], async (req, res) => {
+  const { code } = req.query;
+
+  if (!code) {
+    return res.status(400).send("No Auth Code received");
+  }
+
+  const clientId = process.env.GITHUB_CLIENT_ID;
+  const clientSecret = process.env.GITHUB_CLIENT_SECRET;
+  const isConfigured = !!clientId && !!clientSecret;
+
+  let accessToken = "";
+  let errorMsg = "";
+
+  if (!isConfigured || code === "demo_auth_code_98765") {
+    accessToken = "demo_mode_github_token_atom_999";
+  } else {
+    try {
+      const response = await fetch("https://github.com/login/oauth/access_token", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Accept": "application/json"
+        },
+        body: JSON.stringify({
+          client_id: clientId,
+          client_secret: clientSecret,
+          code: code
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error(`GitHub token exchange status code: ${response.status}`);
+      }
+
+      const body = await response.json() as any;
+      if (body.error) {
+        throw new Error(`GitHub OAuth error response: ${body.error_description || body.error}`);
+      }
+
+      accessToken = body.access_token;
+    } catch (err: any) {
+      console.error("Error exchanging GitHub auth code:", err);
+      errorMsg = err.message || "OAuth exchange failed";
+    }
+  }
+
+  if (errorMsg) {
+    return res.send(`
+      <html>
+        <body style="font-family: system-ui, sans-serif; background: #1a1e24; color: #f43f5e; padding: 40px; text-align: center;">
+          <div style="max-width: 480px; margin: 0 auto; background: #22272e; padding: 30px; border-radius: 8px; border: 1px solid #ff7b72; box-shadow: 0 4px 12px rgba(0,0,0,0.5);">
+            <h2 style="margin-top:0;">⚠️ GitHub Connection Error</h2>
+            <p style="color: #adbac7; line-height: 1.5; font-size: 14px;">${errorMsg}</p>
+            <p style="color: #768390; font-size: 11px;">Make sure your Client ID and Client Secret match your GitHub Developer App configuration.</p>
+            <button onclick="window.close()" style="background: #ff7b72; color: #1a1e24; border: none; padding: 10px 20px; border-radius: 4px; font-weight: bold; cursor: pointer; margin-top: 15px;">
+              Close Window
+            </button>
+          </div>
+        </body>
+      </html>
+    `);
+  }
+
+  res.send(`
+    <html>
+      <body style="font-family: system-ui, sans-serif; background: #1a1e24; color: #57ab5a; padding: 40px; text-align: center;">
+        <div style="max-width: 480px; margin: 0 auto; background: #22272e; padding: 30px; border-radius: 8px; border: 1px solid #347d39; box-shadow: 0 4px 12px rgba(0,0,0,0.5);">
+          <div style="font-size: 40px; margin-bottom: 10px;">🐙</div>
+          <h2 style="margin-top:0; color: #57ab5a;">⚛️ GitHub Profile Connected</h2>
+          <p style="color: #adbac7; line-height: 1.5; font-size: 14px;">Atom IDE clone successfully synchronized. Preparing your workspace views...</p>
+          <script>
+            if (window.opener) {
+              window.opener.postMessage({ 
+                type: 'OAUTH_AUTH_SUCCESS', 
+                token: '${accessToken}',
+                isDemo: ${accessToken.startsWith("demo_mode_")}
+              }, '*');
+              window.close();
+            } else {
+              window.location.href = '/';
+            }
+          </script>
+          <p style="color: #768390; font-size: 11px; margin-top: 20px;">You can safely close this window if it does not close automatically.</p>
+        </div>
+      </body>
+    </html>
+  `);
+});
+
+// 3. User profile details proxy API
+app.get("/api/github/user", async (req, res) => {
+  const token = (req.headers["x-github-token"] as string) || "";
+  if (!token) {
+    return res.status(401).json({ error: "Missing GitHub access token" });
+  }
+
+  if (token.startsWith("demo_mode_")) {
+    return res.json({
+      login: "OctocatHacker",
+      id: 583234,
+      avatar_url: "https://github.githubassets.com/images/modules/logos_page/Octocat.png",
+      html_url: "https://github.com/github/octocat",
+      name: "Atom Sandbox User",
+      company: "Atom Project",
+      location: "San Francisco, CA",
+      bio: "Crafting beautiful source editors for the web.",
+      public_repos: 18,
+      followers: 4122
+    });
+  }
+
+  try {
+    const response = await fetch("https://api.github.com/user", {
+      headers: getGitHubHeaders(token)
+    });
+
+    if (!response.ok) {
+      return res.status(response.status).json({ error: `GitHub API error: ${response.statusText}` });
+    }
+
+    const data = await response.json();
+    res.json(data);
+  } catch (err: any) {
+    console.error("User proxy error:", err);
+    res.status(500).json({ error: err.message || "Failed to fetch user profile" });
+  }
+});
+
+// 4. Repositories list proxy API
+app.get("/api/github/repos", async (req, res) => {
+  const token = (req.headers["x-github-token"] as string) || "";
+  if (!token) {
+    return res.status(401).json({ error: "Missing GitHub access token" });
+  }
+
+  if (token.startsWith("demo_mode_")) {
+    return res.json([
+      { id: 101, name: "quantum-gravity-synthesizer", full_name: "OctocatHacker/quantum-gravity-synthesizer", description: "The central flux gravity vector module in classic ES6.", html_url: "https://github.com", updated_at: new Date().toISOString() },
+      { id: 102, name: "atom-ide-clones", full_name: "OctocatHacker/atom-ide-clones", description: "Breathtaking source codes mirroring beautiful traditional desktop editors.", html_url: "https://github.com", updated_at: new Date().toISOString() },
+      { id: 103, name: "react-sandbox-engine", full_name: "OctocatHacker/react-sandbox-engine", description: "Fast node development proxy running on sandboxed Cloud Run containers.", html_url: "https://github.com", updated_at: new Date().toISOString() }
+    ]);
+  }
+
+  try {
+    const response = await fetch("https://api.github.com/user/repos?per_page=100&sort=updated", {
+      headers: getGitHubHeaders(token)
+    });
+
+    if (!response.ok) {
+      return res.status(response.status).json({ error: `GitHub API error: ${response.statusText}` });
+    }
+
+    const data = await response.json();
+    res.json(data);
+  } catch (err: any) {
+    console.error("Repos proxy error:", err);
+    res.status(500).json({ error: err.message || "Failed to fetch repositories" });
+  }
+});
+
+// 5. Gists creation proxy API
+app.post("/api/github/gists", async (req, res) => {
+  const token = (req.headers["x-github-token"] as string) || "";
+  if (!token) {
+    return res.status(401).json({ error: "Missing GitHub access token" });
+  }
+
+  const { description, files, isPublic } = req.body;
+
+  if (token.startsWith("demo_mode_")) {
+    const fileNames = Object.keys(files || {});
+    return res.json({
+      html_url: "https://gist.github.com/mock-gist-url-sandbox",
+      id: "mock-gist-id-xyz",
+      description: description || "Gist published from Atom IDE",
+      public: isPublic !== false,
+      files: Object.fromEntries(fileNames.map(name => [name, { filename: name, raw_url: "https://gist.githubusercontent.com/mock" }])),
+      demo: true
+    });
+  }
+
+  try {
+    const response = await fetch("https://api.github.com/gists", {
+      method: "POST",
+      headers: getGitHubHeaders(token),
+      body: JSON.stringify({
+        description: description || "Gist published from Atom IDE Clone",
+        public: isPublic !== false,
+        files: files
+      })
+    });
+
+    if (!response.ok) {
+      const errMsg = await response.text();
+      return res.status(response.status).json({ error: `GitHub API error: ${errMsg || response.statusText}` });
+    }
+
+    const data = await response.json();
+    res.json(data);
+  } catch (err: any) {
+    console.error("Gist proxy error:", err);
+    res.status(500).json({ error: err.message || "Failed to publish gist" });
+  }
+});
+
+// 6. Push code to Repository proxy API (Commit Simulation)
+app.post("/api/github/push", async (req, res) => {
+  const token = (req.headers["x-github-token"] as string) || "";
+  if (!token) {
+    return res.status(401).json({ error: "Missing GitHub access token" });
+  }
+
+  const { repo, path, content, message, branch } = req.body;
+  if (!repo || !path || content === undefined) {
+    return res.status(400).json({ error: "Missing required push parameters (repo, path, content)" });
+  }
+
+  if (token.startsWith("demo_mode_")) {
+    return res.json({
+      success: true,
+      commit: {
+        sha: "cf83bc91a472b5368a15a81ca030d95681ca030d",
+        html_url: `https://github.com/${repo}/commit/mock-commit-sha`,
+        message: message || "Atom Web IDE push"
+      },
+      content: {
+        name: path.split("/").pop(),
+        path: path,
+        html_url: `https://github.com/${repo}/blob/${branch || "main"}/${path}`
+      },
+      demo: true
+    });
+  }
+
+  try {
+    const [owner, name] = repo.split("/");
+    const headers = getGitHubHeaders(token);
+    
+    // Check if file exists to get existing SHA (otherwise update operation fails on GitHub)
+    const cleanPath = path.replace(/^\//, "");
+    const checkUrl = `https://api.github.com/repos/${owner}/${name}/contents/${cleanPath}?ref=${branch || "main"}`;
+    let sha: string | undefined;
+
+    try {
+      const checkRes = await fetch(checkUrl, { headers });
+      if (checkRes.ok) {
+        const checkData = await checkRes.json() as any;
+        if (checkData && checkData.sha) {
+          sha = checkData.sha;
+        }
+      }
+    } catch (_) {
+      // File doesn't exist yet, safe to proceed without sha
+    }
+
+    // Base64 encode file content
+    const base64Content = Buffer.from(content).toString("base64");
+    
+    const requestBody: any = {
+      message: message || `Updated ${cleanPath} via Atom Web IDE`,
+      content: base64Content,
+      branch: branch || "main"
+    };
+
+    if (sha) {
+      requestBody.sha = sha;
+    }
+
+    const putUrl = `https://api.github.com/repos/${owner}/${name}/contents/${cleanPath}`;
+    const putRes = await fetch(putUrl, {
+      method: "PUT",
+      headers,
+      body: JSON.stringify(requestBody)
+    });
+
+    if (!putRes.ok) {
+      const errorText = await putRes.text();
+      return res.status(putRes.status).json({ error: `GitHub API error during push: ${errorText || putRes.statusText}` });
+    }
+
+    const data = await putRes.json() as any;
+    res.json({
+      success: true,
+      commit: data.commit,
+      content: data.content
+    });
+  } catch (err: any) {
+    console.error("Push proxy error:", err);
+    res.status(500).json({ error: err.message || "Failed to commit and push file to GitHub" });
+  }
+});
+
 const server = http.createServer(app);
 
 // WebSocket real-time presence, state synchronization & chats
